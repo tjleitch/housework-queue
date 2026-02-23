@@ -1,17 +1,16 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 /**
- * Housework Queue MVP
- * - Local storage (IndexedDB would be ideal later; localStorage is fine for MVP)
- * - Paste-import chores (tab or comma separated)
- * - Daily plan to fill 60 minutes (0..60, never exceed)
- * - Prioritize overdue tasks
- * - Mark done -> enter actual minutes -> estimate updates (EWMA)
- * - Add/Edit/Delete tasks
+ * Housework Queue MVP (Locked Daily Plan)
+ * - Local storage via localStorage (simple MVP)
  * - Backup/Restore JSON
+ * - Import paste rows (tab or comma separated)
+ * - Daily plan "locks" once generated; tasks do NOT refill as you complete them
+ * - Mark done -> enter actual minutes -> estimate updates (EWMA)
+ * - Add/Edit/Delete tasks; edit frequency (days), last done, estimate
  */
 
-const STORAGE_KEY = "housework_queue_v1";
+const STORAGE_KEY = "housework_queue_v2";
 
 function todayISO() {
   const d = new Date();
@@ -23,13 +22,14 @@ function todayISO() {
 
 function parseUSDateToISO(s) {
   // Accepts: M/D/YYYY, MM/DD/YYYY, or YYYY-MM-DD
-  const t = String(s).trim();
+  const t = String(s ?? "").trim();
   if (!t) return null;
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
 
   const m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (!m) return null;
+
   const mm = String(m[1]).padStart(2, "0");
   const dd = String(m[2]).padStart(2, "0");
   const yy = m[3];
@@ -81,31 +81,11 @@ function saveState(state) {
 }
 
 function defaultTasksFromSample() {
-  // A tiny seed list so the app isn't empty if someone opens it without importing
   const t = todayISO();
   return [
     { id: uid(), name: "Swiffer front hallway", freqDays: 4, lastDoneISO: addDaysISO(t, -10), estMin: 15, history: [] },
     { id: uid(), name: "Change AC filters", freqDays: 31, lastDoneISO: addDaysISO(t, -60), estMin: 15, history: [] },
   ];
-}
-
-/**
- * Urgency scoring:
- * - Determine lateness ratio = daysSinceDone / freqDays
- * - overdue if ratio >= 1
- * - score ramps faster the more overdue it is (relative to frequency)
- */
-function urgencyScore(task, nowISO) {
-  const freq = Math.max(1, task.freqDays);
-  const daysSince = Math.max(0, daysBetweenISO(task.lastDoneISO, nowISO));
-  const ratio = daysSince / freq;
-
-  // Not due yet: small score, so it can still appear when not much is overdue
-  if (ratio < 1) return 0.02 * ratio;
-
-  const base = ratio - 1;
-  // Quadratic ramp for overdue items + a small linear term
-  return base * base + 0.05 * ratio;
 }
 
 function computeDueISO(task) {
@@ -118,13 +98,28 @@ function isOverdue(task, nowISO) {
 }
 
 /**
+ * Urgency scoring:
+ * latenessRatio = daysSinceDone / freqDays
+ * overdue if ratio >= 1
+ * score ramps faster the more overdue it is (relative to frequency)
+ */
+function urgencyScore(task, nowISO) {
+  const freq = Math.max(1, task.freqDays);
+  const daysSince = Math.max(0, daysBetweenISO(task.lastDoneISO, nowISO));
+  const ratio = daysSince / freq;
+
+  if (ratio < 1) return 0.02 * ratio; // small for not-due
+  const base = ratio - 1;
+  return base * base + 0.05 * ratio; // ramps as overdue grows
+}
+
+/**
  * Build today's plan:
  * - Each task at most once/day
- * - Prioritize overdue (by urgency score)
- * - Fill up to budget minutes (<= budget, tries to get close)
+ * - Prioritize overdue first (then score)
+ * - Fill up to budget minutes (<= budget)
  *
- * For MVP we do a greedy fill in score order.
- * (We can upgrade to knapsack later once you have varied times.)
+ * Greedy fill is fine initially; can upgrade later.
  */
 function buildPlan(tasks, nowISO, budgetMin) {
   const scored = tasks
@@ -136,12 +131,9 @@ function buildPlan(tasks, nowISO, budgetMin) {
       dueISO: computeDueISO(t),
     }))
     .sort((a, b) => {
-      // Overdue first
-      if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
-      // Higher score first
-      if (b.score !== a.score) return b.score - a.score;
-      // Earlier due date first
-      return a.dueISO.localeCompare(b.dueISO);
+      if (a.overdue !== b.overdue) return a.overdue ? -1 : 1; // overdue first
+      if (b.score !== a.score) return b.score - a.score; // higher score first
+      return a.dueISO.localeCompare(b.dueISO); // earlier due first
     });
 
   const picked = [];
@@ -154,7 +146,7 @@ function buildPlan(tasks, nowISO, budgetMin) {
     total += item.est;
   }
 
-  // If we picked nothing (rare), pick the single most urgent task even if it exceeds budget
+  // If nothing fits (rare), pick the most urgent single task
   if (picked.length === 0 && scored.length > 0) {
     picked.push(scored[0].task.id);
     total = Math.max(1, scored[0].est);
@@ -165,7 +157,7 @@ function buildPlan(tasks, nowISO, budgetMin) {
 
 function formatOverdueLabel(task, nowISO) {
   const due = computeDueISO(task);
-  const delta = daysBetweenISO(due, nowISO); // positive = overdue
+  const delta = daysBetweenISO(due, nowISO); // positive overdue
   if (delta > 0) return `Overdue by ${delta}d`;
   if (delta === 0) return `Due today`;
   return `Due in ${Math.abs(delta)}d`;
@@ -218,15 +210,13 @@ function normalizeImportedRow(parts) {
 }
 
 function parsePaste(text) {
-  // Accepts tab-separated or comma-separated rows; ignores blank lines
-  const lines = text
+  const lines = String(text ?? "")
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
 
   const tasks = [];
   for (const line of lines) {
-    // Prefer tab split if it looks tabby
     const parts = line.includes("\t")
       ? line.split("\t")
       : line.split(",").map((p) => p.trim());
@@ -236,6 +226,8 @@ function parsePaste(text) {
   }
   return tasks;
 }
+
+/* ---------- UI helpers ---------- */
 
 function Card({ children }) {
   return (
@@ -254,8 +246,7 @@ function Card({ children }) {
 }
 
 function SmallButton({ children, onClick, kind = "default", title, disabled }) {
-  const bg =
-    kind === "primary" ? "#111" : kind === "danger" ? "#b00020" : "#f3f3f3";
+  const bg = kind === "primary" ? "#111" : kind === "danger" ? "#b00020" : "#f3f3f3";
   const fg = kind === "primary" || kind === "danger" ? "#fff" : "#111";
   return (
     <button
@@ -378,51 +369,96 @@ function Tabs({ tab, setTab }) {
   );
 }
 
+/* ---------- App ---------- */
+
 export default function App() {
   const [tab, setTab] = useState("today");
 
   const [state, setState] = useState(() => {
     const loaded = loadState();
-    if (loaded?.tasks?.length) return loaded;
-    const seed = { tasks: defaultTasksFromSample() };
+
+    // Upgrade older saved data
+    if (loaded?.tasks?.length) {
+      if (!("todayPlan" in loaded)) loaded.todayPlan = null;
+      return loaded;
+    }
+
+    const seed = {
+      tasks: defaultTasksFromSample(),
+      todayPlan: null, // { dateISO, pickedIds: string[], completedIds: string[] }
+    };
     saveState(seed);
     return seed;
   });
 
   const [budgetMin, setBudgetMin] = useState(60);
-
   const nowISO = todayISO();
 
-  // Plan is generated daily, but for MVP we generate whenever tasks change.
-  const plan = useMemo(() => buildPlan(state.tasks, nowISO, budgetMin), [state.tasks, nowISO, budgetMin]);
-
-  const plannedTasks = useMemo(() => {
-    const map = new Map(state.tasks.map((t) => [t.id, t]));
-    return plan.pickedIds.map((id) => map.get(id)).filter(Boolean);
-  }, [state.tasks, plan.pickedIds]);
-
-  const totalEst = plannedTasks.reduce((sum, t) => sum + Math.max(1, t.estMin || 15), 0);
-
-  // Done modal
-  const [doneOpen, setDoneOpen] = useState(false);
-  const [doneTaskId, setDoneTaskId] = useState(null);
-  const [actualMin, setActualMin] = useState(15);
-
-  // Add/Edit modal
-  const [editOpen, setEditOpen] = useState(false);
-  const [editTaskId, setEditTaskId] = useState(null);
-
-  // Import box
-  const [importText, setImportText] = useState("");
-
-  // Persist state
+  // Persist app state
   useEffect(() => {
     saveState(state);
   }, [state]);
 
+  // Create today's plan if needed (once/day)
+  useEffect(() => {
+    if (!state.todayPlan || state.todayPlan.dateISO !== nowISO) {
+      ensureTodayPlan(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nowISO]);
+
+  // Create/replace today's plan
+  function ensureTodayPlan(forceRegenerate = false) {
+    setState((prev) => {
+      const existing = prev.todayPlan;
+      const isForToday = existing?.dateISO === nowISO;
+
+      if (!forceRegenerate && isForToday) return prev;
+
+      const plan = buildPlan(prev.tasks, nowISO, budgetMin);
+
+      return {
+        ...prev,
+        todayPlan: {
+          dateISO: nowISO,
+          pickedIds: plan.pickedIds,
+          completedIds: [],
+        },
+      };
+    });
+  }
+
+  // Today's tasks are from todayPlan, minus completedIds
+  const plannedTasks = useMemo(() => {
+    const pickedIds = state.todayPlan?.pickedIds ?? [];
+    const completed = new Set(state.todayPlan?.completedIds ?? []);
+    const map = new Map(state.tasks.map((t) => [t.id, t]));
+
+    return pickedIds
+      .filter((id) => !completed.has(id))
+      .map((id) => map.get(id))
+      .filter(Boolean);
+  }, [state.tasks, state.todayPlan]);
+
+  const totalEstRemaining = plannedTasks.reduce((sum, t) => sum + Math.max(1, t.estMin || 15), 0);
+
+  /* ---- Done modal ---- */
+  const [doneOpen, setDoneOpen] = useState(false);
+  const [doneTaskId, setDoneTaskId] = useState(null);
+
+  // IMPORTANT: string while typing so user can delete freely
+  const [actualMin, setActualMin] = useState("15");
+
+  /* ---- Add/Edit modal ---- */
+  const [editOpen, setEditOpen] = useState(false);
+  const [editTaskId, setEditTaskId] = useState(null);
+
+  /* ---- Import box ---- */
+  const [importText, setImportText] = useState("");
+
   function openDone(task) {
     setDoneTaskId(task.id);
-    setActualMin(Math.max(1, task.estMin || 15));
+    setActualMin(String(Math.max(1, task.estMin || 15)));
     setDoneOpen(true);
   }
 
@@ -430,14 +466,15 @@ export default function App() {
     const id = doneTaskId;
     if (!id) return;
 
+    const actual = clampInt(actualMin, 1, 240);
+
     setState((prev) => {
       const tasks = prev.tasks.map((t) => {
         if (t.id !== id) return t;
 
-        const newEst = ewmaUpdate(t.estMin, actualMin, 0.3);
+        const newEst = ewmaUpdate(t.estMin, actual, 0.3);
         const newHist = Array.isArray(t.history) ? [...t.history] : [];
-        newHist.unshift({ dateISO: nowISO, actualMin: clampInt(actualMin, 1, 240) });
-        // Keep only last 20 entries
+        newHist.unshift({ dateISO: nowISO, actualMin: actual });
         const trimmed = newHist.slice(0, 20);
 
         return {
@@ -447,7 +484,23 @@ export default function App() {
           history: trimmed,
         };
       });
-      return { ...prev, tasks };
+
+      const tp = prev.todayPlan;
+      if (!tp || tp.dateISO !== nowISO) {
+        return { ...prev, tasks };
+      }
+
+      const completedSet = new Set(tp.completedIds || []);
+      completedSet.add(id);
+
+      return {
+        ...prev,
+        tasks,
+        todayPlan: {
+          ...tp,
+          completedIds: Array.from(completedSet),
+        },
+      };
     });
 
     setDoneOpen(false);
@@ -462,33 +515,52 @@ export default function App() {
   function upsertTask(updated) {
     setState((prev) => {
       const exists = prev.tasks.some((t) => t.id === updated.id);
-      const tasks = exists
-        ? prev.tasks.map((t) => (t.id === updated.id ? updated : t))
-        : [...prev.tasks, updated];
+      const tasks = exists ? prev.tasks.map((t) => (t.id === updated.id ? updated : t)) : [...prev.tasks, updated];
+
+      // If you edit tasks, we keep today's plan as-is (locked).
+      // You can regenerate manually if you want the changes reflected immediately.
       return { ...prev, tasks };
     });
   }
 
   function deleteTask(id) {
-    setState((prev) => ({ ...prev, tasks: prev.tasks.filter((t) => t.id !== id) }));
+    setState((prev) => {
+      const tasks = prev.tasks.filter((t) => t.id !== id);
+
+      // Also remove it from today's plan if it exists there
+      const tp = prev.todayPlan;
+      const todayPlan = tp
+        ? {
+            ...tp,
+            pickedIds: (tp.pickedIds || []).filter((x) => x !== id),
+            completedIds: (tp.completedIds || []).filter((x) => x !== id),
+          }
+        : null;
+
+      return { ...prev, tasks, todayPlan };
+    });
   }
 
-  function importTasks() {
+  function importTasksReplaceList() {
     const parsed = parsePaste(importText);
     if (parsed.length === 0) {
-      alert("I couldn't find any valid rows. Make sure each row has 4 columns: name, frequency(days), last done (M/D/YYYY), minutes.");
+      alert("No valid rows found. Each row needs 4 columns: name, frequency(days), last done (M/D/YYYY), minutes.");
       return;
     }
-    setState((prev) => ({ ...prev, tasks: parsed }));
+    setState((prev) => ({
+      ...prev,
+      tasks: parsed,
+      todayPlan: null, // force new plan
+    }));
     setImportText("");
     setTab("today");
   }
 
   function backupNow() {
     const payload = {
-      version: 1,
+      version: 2,
       exportedAtISO: new Date().toISOString(),
-      tasks: state.tasks,
+      state,
     };
     downloadText(`housework-backup-${nowISO}.json`, JSON.stringify(payload, null, 2));
   }
@@ -497,9 +569,24 @@ export default function App() {
     try {
       const txt = await readFileText(file);
       const parsed = JSON.parse(txt);
-      if (!parsed?.tasks || !Array.isArray(parsed.tasks)) throw new Error("Invalid backup format");
-      setState({ tasks: parsed.tasks });
-      setTab("today");
+
+      // Support v1 backups that had {tasks: [...]}
+      if (parsed?.tasks && Array.isArray(parsed.tasks)) {
+        setState({ tasks: parsed.tasks, todayPlan: null });
+        setTab("today");
+        return;
+      }
+
+      // v2 backups store { state: {tasks, todayPlan} }
+      if (parsed?.state?.tasks && Array.isArray(parsed.state.tasks)) {
+        const st = parsed.state;
+        if (!("todayPlan" in st)) st.todayPlan = null;
+        setState({ tasks: st.tasks, todayPlan: st.todayPlan ?? null });
+        setTab("today");
+        return;
+      }
+
+      throw new Error("Invalid backup format.");
     } catch (e) {
       alert(`Restore failed: ${e.message || String(e)}`);
     }
@@ -509,6 +596,8 @@ export default function App() {
     if (!editTaskId) return null;
     return state.tasks.find((t) => t.id === editTaskId) || null;
   }, [editTaskId, state.tasks]);
+
+  const todayHasPlan = (state.todayPlan?.dateISO === nowISO) && (state.todayPlan?.pickedIds?.length ?? 0) > 0;
 
   return (
     <div style={{ padding: 16, maxWidth: 920, margin: "0 auto" }}>
@@ -538,24 +627,43 @@ export default function App() {
               <div>
                 <div style={{ fontSize: 14, color: "#444" }}>Today ({nowISO})</div>
                 <div style={{ fontSize: 22, fontWeight: 700 }}>
-                  {totalEst} / {budgetMin} min (estimated)
+                  {totalEstRemaining} / {budgetMin} min remaining (estimated)
                 </div>
                 <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
-                  Overdue tasks are prioritized. Each task appears at most once per day.
+                  Today’s list is locked. Completing tasks won’t pull in replacements.
                 </div>
               </div>
+
               <div style={{ display: "flex", gap: 10, alignItems: "flex-start", flexWrap: "wrap" }}>
                 <SmallButton kind="primary" onClick={() => openEdit(null)}>
                   + Add Task
                 </SmallButton>
                 <SmallButton onClick={() => setTab("import")}>Import</SmallButton>
+                <SmallButton onClick={() => ensureTodayPlan(true)} title="Generate a new list for today (optional)">
+                  Regenerate
+                </SmallButton>
               </div>
             </div>
           </Card>
 
-          {plannedTasks.length === 0 ? (
+          {!todayHasPlan ? (
             <Card>
-              <div>No tasks yet. Go to Import or add one manually.</div>
+              <div style={{ fontSize: 14 }}>
+                No plan for today yet.
+              </div>
+              <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <SmallButton kind="primary" onClick={() => ensureTodayPlan(true)}>
+                  Generate Today’s List
+                </SmallButton>
+                <SmallButton onClick={() => setTab("import")}>Import tasks</SmallButton>
+              </div>
+            </Card>
+          ) : plannedTasks.length === 0 ? (
+            <Card>
+              <div style={{ fontSize: 18, fontWeight: 650 }}>All done for today ✅</div>
+              <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
+                Come back tomorrow for a new set — or press Regenerate if you want more.
+              </div>
             </Card>
           ) : (
             plannedTasks.map((t) => (
@@ -564,15 +672,9 @@ export default function App() {
                   <div style={{ minWidth: 260 }}>
                     <div style={{ fontSize: 18, fontWeight: 650 }}>{t.name}</div>
                     <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 6 }}>
-                      <span style={{ fontSize: 12, color: "#555" }}>
-                        {formatOverdueLabel(t, nowISO)}
-                      </span>
-                      <span style={{ fontSize: 12, color: "#555" }}>
-                        Every {t.freqDays}d
-                      </span>
-                      <span style={{ fontSize: 12, color: "#555" }}>
-                        Est {Math.max(1, t.estMin || 15)} min
-                      </span>
+                      <span style={{ fontSize: 12, color: "#555" }}>{formatOverdueLabel(t, nowISO)}</span>
+                      <span style={{ fontSize: 12, color: "#555" }}>Every {t.freqDays}d</span>
+                      <span style={{ fontSize: 12, color: "#555" }}>Est {Math.max(1, t.estMin || 15)} min</span>
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -595,7 +697,7 @@ export default function App() {
               <div>
                 <div style={{ fontSize: 18, fontWeight: 700 }}>All Tasks</div>
                 <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
-                  Tap Edit to change frequency, last done date, or time estimate.
+                  Edit frequency (days), last done date, or time estimate.
                 </div>
               </div>
               <SmallButton kind="primary" onClick={() => openEdit(null)}>
@@ -644,12 +746,12 @@ export default function App() {
           <Card>
             <div style={{ fontSize: 18, fontWeight: 700 }}>Import from your spreadsheet</div>
             <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-              Paste rows in this format (tab-separated or comma-separated):
+              Paste rows as tab-separated (best) or comma-separated:
               <div style={{ marginTop: 6, padding: 10, background: "#f6f6f6", borderRadius: 10, border: "1px solid #eee" }}>
                 Swiffer front hallway [tab] 4 [tab] 8/26/2025 [tab] 15
               </div>
               Dates can be M/D/YYYY or YYYY-MM-DD.
-              Import will <b>replace</b> your current task list (MVP behavior).
+              <b>Import will replace your current task list.</b>
             </div>
 
             <textarea
@@ -668,7 +770,7 @@ export default function App() {
             />
 
             <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-              <SmallButton kind="primary" onClick={importTasks}>
+              <SmallButton kind="primary" onClick={importTasksReplaceList}>
                 Import (Replace list)
               </SmallButton>
               <SmallButton onClick={() => setImportText("")}>Clear</SmallButton>
@@ -683,7 +785,7 @@ export default function App() {
           <Card>
             <div style={{ fontSize: 18, fontWeight: 700 }}>Backup & Restore</div>
             <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-              Your data is stored locally on your device. Use backup to avoid losing it.
+              Data is stored locally on your device. Use backup to prevent loss.
             </div>
 
             <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
@@ -721,8 +823,7 @@ export default function App() {
                 kind="danger"
                 onClick={() => {
                   if (confirm("Reset app data? This cannot be undone (unless you have a backup).")) {
-                    const seed = { tasks: [] };
-                    setState(seed);
+                    setState({ tasks: [], todayPlan: null });
                   }
                 }}
               >
@@ -751,9 +852,16 @@ export default function App() {
               <div style={{ fontSize: 12, color: "#666" }}>
                 Current estimate: {Math.max(1, t.estMin || 15)} min. This will update based on what you enter.
               </div>
+
               <Field label="How many minutes did it actually take?">
-                <NumberInput value={actualMin} min={1} max={240} onChange={(e) => setActualMin(clampInt(e.target.value, 1, 240))} />
+                <NumberInput
+                  value={actualMin}
+                  min={1}
+                  max={240}
+                  onChange={(e) => setActualMin(e.target.value)}
+                />
               </Field>
+
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                 <SmallButton kind="primary" onClick={confirmDone}>
                   Confirm Done
@@ -794,7 +902,7 @@ export default function App() {
 
       <div style={{ height: 20 }} />
       <div style={{ fontSize: 12, color: "#777" }}>
-        Tip: After you deploy to GitHub Pages, open it on iPhone → Share → “Add to Home Screen”.
+        Tip: On iPhone (Safari) → Share → “Add to Home Screen”.
       </div>
     </div>
   );
@@ -816,14 +924,21 @@ function TaskEditor({ task, onSave, onDelete, nowISO }) {
     setEstMin(task.estMin ?? 15);
   }, [task, nowISO]);
 
-  const dueISO = useMemo(() => addDaysISO(lastDoneISO, Math.max(1, Number(freqDays) || 1)), [lastDoneISO, freqDays]);
+  const dueISO = useMemo(
+    () => addDaysISO(parseUSDateToISO(lastDoneISO) || lastDoneISO, Math.max(1, Number(freqDays) || 1)),
+    [lastDoneISO, freqDays]
+  );
 
   function save() {
     const n = name.trim();
     if (!n) return alert("Please enter a task name.");
+
     const f = clampInt(freqDays, 1, 3650);
-    const l = parseUSDateToISO(lastDoneISO) || lastDoneISO;
+
+    const lRaw = String(lastDoneISO ?? "").trim();
+    const l = parseUSDateToISO(lRaw) || lRaw;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(l)) return alert("Last done date must be YYYY-MM-DD or M/D/YYYY.");
+
     const e = clampInt(estMin, 1, 240);
 
     const out = {
@@ -845,10 +960,10 @@ function TaskEditor({ task, onSave, onDelete, nowISO }) {
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         <Field label="Frequency (days)">
-          <NumberInput value={freqDays} min={1} max={3650} onChange={(e) => setFreqDays(clampInt(e.target.value, 1, 3650))} />
+          <NumberInput value={freqDays} min={1} max={3650} onChange={(e) => setFreqDays(e.target.value)} />
         </Field>
         <Field label="Estimated minutes">
-          <NumberInput value={estMin} min={1} max={240} onChange={(e) => setEstMin(clampInt(e.target.value, 1, 240))} />
+          <NumberInput value={estMin} min={1} max={240} onChange={(e) => setEstMin(e.target.value)} />
         </Field>
       </div>
 
